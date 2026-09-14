@@ -1,22 +1,28 @@
 import asyncio
 import aiohttp
 import socket
+import base64
 
-async def fetch_source(session, url):
+async def fetch_source(session, url, timeout=15.0):
+    """
+    دریافت منبع با محدودیت ۱۵ ثانیه، مدیریت تایم‌آوت و دیکد کردن خودکار Base64
+    """
     try:
-        async with session.get(url, timeout=10) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             if resp.status == 200:
                 text = await resp.text()
-                # Handle Base64 if needed
+                # بررسی و مدیریت Base64 در صورت نیاز
                 try:
-                    if not "://" in text[:50]:
+                    if text and not "://" in text[:50]:
                         decoded = base64.b64decode(text).decode("utf-8", errors="ignore")
-                        return decoded.splitlines()
+                        return [line.strip() for line in decoded.splitlines() if line.strip()]
                 except Exception:
                     pass
-                return text.splitlines()
-    except Exception:
-        pass
+                return [line.strip() for line in text.splitlines() if line.strip()]
+    except asyncio.TimeoutError:
+        print(f"[-] تایم‌آوت (Timeout) در دریافت از منبع: {url}")
+    except Exception as e:
+        print(f"[-] خطا در دریافت منبع {url}: {e}")
     return []
 
 async def check_tcp(host, port, timeout=1.5):
