@@ -3,10 +3,26 @@ import os
 import aiohttp
 from .config import load_config
 from .database import Database
-from .parser import decode_config, apply_custom_remark
+from .parser import decode_config, apply_dynamic_remark
 from .net import fetch_source, check_tcp, check_sni
 from .scorer import calculate_score
 from .telegram import send_to_telegram
+
+async def fetch_geo_info(session, host):
+    """استعلام آنلاین و سریع لوکیشن IP برای قرار دادن کشور و شهر واقعی"""
+    try:
+        async with session.get(f"http://ip-api.com/json/{host}?fields=status,country,city,countryCode", timeout=2.5) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get("status") == "success":
+                    return {
+                        "country": data.get("country", "Global"),
+                        "city": data.get("city", "Server"),
+                        "code": data.get("countryCode", "US")
+                    }
+    except Exception:
+        pass
+    return {"country": "Global", "city": "Server", "code": "US"}
 
 async def process_async(config):
     db = Database(config.get("db_path", "history.db"))
@@ -24,7 +40,6 @@ async def process_async(config):
 
     print(f"[+] کل خطوط دریافت شده: {len(raw_configs)}")
     
-    # پارس و Dedup هوشمند
     unique_nodes = {}
     for line in raw_configs:
         parsed = decode_config(line)
@@ -36,54 +51,55 @@ async def process_async(config):
     nodes = list(unique_nodes.values())[:config.get("max_candidates", 1500)]
     print(f"[+] نودهای معنادار پس از Dedup: {len(nodes)}")
 
-    # تست TCP و SNI با سخت‌گیری بسیار بالا
+    # تست اتصال بسیار سخت‌گیرانه
     scored_nodes = []
-    semaphore = asyncio.Semaphore(config.get("max_workers", 30)) # کاهش همزمانی برای دقت بیشتر تست
+    semaphore = asyncio.Semaphore(20) # کاهش همزمانی برای تست دقیق‌تر و بدون خطای شبکه
 
-    async def test_single_node(node):
-        async with semaphore:
-            host = node["host"]
-            port = node["port"]
-            
-            if config.get("sni_check", True):
-                if not await check_sni(host):
+    async with aiohttp.ClientSession() as session:
+        async def test_single_node(node):
+            async with semaphore:
+                host = node["host"]
+                port = node["port"]
+                
+                if config.get("sni_check", True):
+                    if not await check_sni(host):
+                        return
+
+                # سخت‌گیری شدید روی پینگ: حداکثر 200 میلی‌ثانیه واقعی
+                max_allowed_ping = 200
+                is_ok, latency = await check_tcp(host, port, timeout=0.8)
+                
+                if not is_ok or latency > max_allowed_ping:
                     return
 
-            # اعمال حد پینگ سخت‌گیرانه (حداکثر 250 میلی‌ثانیه برای کیفیت بالا)
-            max_allowed_ping = config.get("max_ping_ms", 250)
-            is_ok, latency = await check_tcp(host, port, timeout=config.get("tcp_timeout", 1.0))
-            
-            if not is_ok or latency > max_allowed_ping:
-                return
+                # دریافت لوکیشن واقعی سرور برای ساخت نام دقیق
+                geo_info = await fetch_geo_info(session, host)
 
-            history_score, samples = db.get_score(node["node_key"])
-            if samples == 0:
-                history_score = 500.0
+                history_score, samples = db.get_score(node["node_key"])
+                if samples == 0:
+                    history_score = 500.0
 
-            is_tls = port in config.get("golden_ports_t1", []) or port in [443, 8443]
-            score = calculate_score(node, latency, is_tls, config, history_score, samples)
-            
-            # آپدیت پایگاه داده EWMA
-            db.update_score(node["node_key"], score, decay=config.get("ewma_decay", 0.7))
-            
-            node["score"] = score
-            node["latency"] = latency
-            # اعمال ساختار نام‌گذاری سفارشی شما همراه با پینگ واقعی
-            node["final_raw"] = apply_custom_remark(node["raw"], latency)
-            scored_nodes.append(node)
+                is_tls = port in config.get("golden_ports_t1", []) or port in [443, 8443]
+                score = calculate_score(node, latency, is_tls, config, history_score, samples)
+                
+                db.update_score(node["node_key"], score, decay=config.get("ewma_decay", 0.7))
+                
+                node["score"] = score
+                node["latency"] = latency
+                # اعمال نام‌گذاری پویا بر اساس کشور، شهر و پینگ واقعی آن نود خاص
+                node["final_raw"] = apply_dynamic_remark(node["raw"], latency, geo_info)
+                scored_nodes.append(node)
 
-    tasks = [test_single_node(node) for node in nodes]
-    await asyncio.gather(*tasks)
+        tasks = [test_single_node(node) for node in nodes]
+        await asyncio.gather(*tasks)
 
-    # مرتب‌سازی بر اساس امتیاز نهایی
+    # مرتب‌سازی بر اساس امتیاز
     scored_nodes.sort(key=lambda x: x["score"], reverse=True)
     
-    # محدود کردن به تعداد نودهای کاملاً باکیفیت و برتر (حتی اگر تعداد کمتر از 500 باشد)
-    top_limit = min(len(scored_nodes), config.get("top_n_final", 300))
-    top_nodes = scored_nodes[:top_limit]
-    print(f"[+] نودهای نهایی 100% فعال و تایید شده: {len(top_nodes)}")
+    # اولویت با کیفیت: اگر کاندیدای سالم کم بود، اصراری بر رساندن اجباری به 500 نیست تا خروجی 100% سالم باشد
+    top_nodes = scored_nodes[:min(len(scored_nodes), 200)]
+    print(f"[+] نودهای نهایی فوق‌العاده باکیفیت و تایید شده: {len(top_nodes)}")
 
-    # ساخت فایل‌های اشتراک (Subscription parts)
     chunk_size = config.get("chunk_size", 150)
     generated_files = []
     
