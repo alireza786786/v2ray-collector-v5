@@ -3,7 +3,7 @@ import os
 import aiohttp
 from .config import load_config
 from .database import Database
-from .parser import decode_config
+from .parser import decode_config, apply_custom_remark
 from .net import fetch_source, check_tcp, check_sni
 from .scorer import calculate_score
 from .telegram import send_to_telegram
@@ -36,9 +36,9 @@ async def process_async(config):
     nodes = list(unique_nodes.values())[:config.get("max_candidates", 1500)]
     print(f"[+] نودهای معنادار پس از Dedup: {len(nodes)}")
 
-    # تست TCP و SNI
+    # تست TCP و SNI با سخت‌گیری بسیار بالا
     scored_nodes = []
-    semaphore = asyncio.Semaphore(config.get("max_workers", 50))
+    semaphore = asyncio.Semaphore(config.get("max_workers", 30)) # کاهش همزمانی برای دقت بیشتر تست
 
     async def test_single_node(node):
         async with semaphore:
@@ -49,8 +49,11 @@ async def process_async(config):
                 if not await check_sni(host):
                     return
 
-            is_ok, latency = await check_tcp(host, port, timeout=config.get("tcp_timeout", 1.5))
-            if not is_ok or latency > config.get("max_ping_ms", 400):
+            # اعمال حد پینگ سخت‌گیرانه (حداکثر 250 میلی‌ثانیه برای کیفیت بالا)
+            max_allowed_ping = config.get("max_ping_ms", 250)
+            is_ok, latency = await check_tcp(host, port, timeout=config.get("tcp_timeout", 1.0))
+            
+            if not is_ok or latency > max_allowed_ping:
                 return
 
             history_score, samples = db.get_score(node["node_key"])
@@ -65,6 +68,8 @@ async def process_async(config):
             
             node["score"] = score
             node["latency"] = latency
+            # اعمال ساختار نام‌گذاری سفارشی شما همراه با پینگ واقعی
+            node["final_raw"] = apply_custom_remark(node["raw"], latency)
             scored_nodes.append(node)
 
     tasks = [test_single_node(node) for node in nodes]
@@ -72,8 +77,11 @@ async def process_async(config):
 
     # مرتب‌سازی بر اساس امتیاز نهایی
     scored_nodes.sort(key=lambda x: x["score"], reverse=True)
-    top_nodes = scored_nodes[:config.get("top_n_final", 500)]
-    print(f"[+] نودهای نهایی تایید شده: {len(top_nodes)}")
+    
+    # محدود کردن به تعداد نودهای کاملاً باکیفیت و برتر (حتی اگر تعداد کمتر از 500 باشد)
+    top_limit = min(len(scored_nodes), config.get("top_n_final", 300))
+    top_nodes = scored_nodes[:top_limit]
+    print(f"[+] نودهای نهایی 100% فعال و تایید شده: {len(top_nodes)}")
 
     # ساخت فایل‌های اشتراک (Subscription parts)
     chunk_size = config.get("chunk_size", 150)
@@ -83,7 +91,7 @@ async def process_async(config):
         chunk = top_nodes[i:i + chunk_size]
         file_name = f"subscription_part{(i // chunk_size) + 1}.txt"
         
-        content = "\n".join([n["raw"] for n in chunk])
+        content = "\n".join([n["final_raw"] for n in chunk])
         with open(file_name, "w", encoding="utf-8") as f:
             f.write(content)
         generated_files.append(file_name)
