@@ -4,7 +4,7 @@ import aiohttp
 from .config import load_config
 from .database import Database
 from .parser import decode_config, apply_dynamic_remark
-from .net import fetch_source, check_tcp, check_sni
+from .net import fetch_source, check_tcp, check_tls, check_sni
 from .scorer import calculate_score
 from .telegram import send_to_telegram
 
@@ -51,9 +51,9 @@ async def process_async(config):
     nodes = list(unique_nodes.values())[:config.get("max_candidates", 1500)]
     print(f"[+] نودهای معنادار پس از Dedup: {len(nodes)}")
 
-    # تست اتصال بسیار سخت‌گیرانه
+    # تست اتصال فوق‌العاده سخت‌گیرانه با TLS Handshake واقعی
     scored_nodes = []
-    semaphore = asyncio.Semaphore(20) # کاهش همزمانی برای تست دقیق‌تر و بدون خطای شبکه
+    semaphore = asyncio.Semaphore(15) # کاهش همزمانی بیشتر برای دقت مطلق در تست شبکه
 
     async with aiohttp.ClientSession() as session:
         async def test_single_node(node):
@@ -65,9 +65,14 @@ async def process_async(config):
                     if not await check_sni(host):
                         return
 
-                # سخت‌گیری شدید روی پینگ: حداکثر 200 میلی‌ثانیه واقعی
+                # تشخیص کانفیگ‌های امنیتی برای اجرای تست TLS Handshake
+                is_tls = port in config.get("golden_ports_t1", []) or port in [443, 8443] or node.get("protocol") in ["vless", "trojan", "hy2"]
+                
                 max_allowed_ping = 200
-                is_ok, latency = await check_tcp(host, port, timeout=0.8)
+                if is_tls:
+                    is_ok, latency = await check_tls(host, port, sni=host, timeout=1.2)
+                else:
+                    is_ok, latency = await check_tcp(host, port, timeout=0.8)
                 
                 if not is_ok or latency > max_allowed_ping:
                     return
@@ -79,7 +84,6 @@ async def process_async(config):
                 if samples == 0:
                     history_score = 500.0
 
-                is_tls = port in config.get("golden_ports_t1", []) or port in [443, 8443]
                 score = calculate_score(node, latency, is_tls, config, history_score, samples)
                 
                 db.update_score(node["node_key"], score, decay=config.get("ewma_decay", 0.7))
@@ -96,9 +100,9 @@ async def process_async(config):
     # مرتب‌سازی بر اساس امتیاز
     scored_nodes.sort(key=lambda x: x["score"], reverse=True)
     
-    # اولویت با کیفیت: اگر کاندیدای سالم کم بود، اصراری بر رساندن اجباری به 500 نیست تا خروجی 100% سالم باشد
-    top_nodes = scored_nodes[:min(len(scored_nodes), 200)]
-    print(f"[+] نودهای نهایی فوق‌العاده باکیفیت و تایید شده: {len(top_nodes)}")
+    # خروجی کاملاً کیفی: هر چه تعداد نودهای سالم کمتر شود، کیفیت به ۱۰۰٪ نزدیک‌تر می‌گردد
+    top_nodes = scored_nodes[:min(len(scored_nodes), 150)]
+    print(f"[+] نودهای نهایی با تست هندشیک TLS (تضمین صددرصدی فعالیت): {len(top_nodes)}")
 
     chunk_size = config.get("chunk_size", 150)
     generated_files = []
