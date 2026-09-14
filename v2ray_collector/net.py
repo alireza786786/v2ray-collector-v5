@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import socket
 import base64
+import ssl
 
 async def fetch_source(session, url, timeout=15.0):
     try:
@@ -22,15 +23,30 @@ async def fetch_source(session, url, timeout=15.0):
     return []
 
 async def check_tcp(host, port, timeout=1.0):
-    """
-    تست TCP بسیار سخت‌گیرانه با تایم‌آوت پایین (1 ثانیه) برای تضمین پایداری واقعی
-    """
     start = asyncio.get_event_loop().time()
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
-        # تست مضاعف خواندن/نوشتن برای اطمینان از برقراری کامل کانال
-        writer.write(b"\x00")
-        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+        latency = (asyncio.get_event_loop().time() - start) * 1000
+        return True, latency
+    except Exception:
+        return False, 0
+
+async def check_tls(host, port, sni=None, timeout=1.5):
+    """
+    تست فوق‌العاده سخت‌گیرانه TLS Handshake برای تضمین زنده بودن سرویس‌های امن
+    """
+    start = asyncio.get_event_loop().time()
+    try:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ssl_context, server_hostname=sni or host),
+            timeout=timeout
+        )
         writer.close()
         await writer.wait_closed()
         latency = (asyncio.get_event_loop().time() - start) * 1000
